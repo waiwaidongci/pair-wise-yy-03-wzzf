@@ -1,5 +1,5 @@
 import * as THREE from 'three'
-import type { ObjectType, SceneObject, Vec3 } from '../types/scene'
+import type { ObjectType, PrefabAsset, SceneObject, Vec3 } from '../types/scene'
 
 export const GEOMETRY_TYPES: ObjectType[] = ['box', 'sphere', 'cylinder', 'cone', 'torus', 'plane']
 export const LIGHT_TYPES: ObjectType[] = ['directionalLight', 'pointLight', 'spotLight']
@@ -11,6 +11,7 @@ export const TYPE_LABELS: Record<ObjectType, string> = {
   cone: '圆锥体',
   torus: '圆环',
   plane: '平面',
+  group: '组合件实例',
   directionalLight: '平行光',
   pointLight: '点光源',
   spotLight: '聚光灯',
@@ -24,6 +25,7 @@ export const TYPE_COLORS: Record<ObjectType, string> = {
   cone: '#ef4444',
   torus: '#8b5cf6',
   plane: '#64748b',
+  group: '#64748b',
   directionalLight: '#fbbf24',
   pointLight: '#f97316',
   spotLight: '#fb7185',
@@ -83,38 +85,75 @@ export function createSceneObject(type: ObjectType, parentId: string | null = nu
   return base
 }
 
-export function createStarterScene(): SceneObject[] {
+export function createStarterScene(): { objects: SceneObject[]; prefabs: PrefabAsset[] } {
   const ground = createSceneObject('plane')
   ground.id = 'ground'
   ground.name = '主地面'
   ground.material.color = '#9aa7b8'
 
-  const hero = createSceneObject('box')
-  hero.id = 'hero-box'
-  hero.name = '核心展台'
-  hero.position = [0, 0.75, 0]
-  hero.scale = [1.5, 1.5, 1.5]
-  hero.material.color = '#2563eb'
-  hero.castShadow = true
-
-  const sphere = createSceneObject('sphere')
-  sphere.id = 'hero-sphere'
-  sphere.name = '悬浮球体'
-  sphere.position = [2.3, 1.25, 0]
-  sphere.material.color = '#14b8a6'
-
-  const ring = createSceneObject('torus')
-  ring.id = 'hero-ring'
-  ring.name = '装饰圆环'
-  ring.position = [-2.2, 1.4, 0]
-  ring.rotation = [Math.PI / 2, 0, 0]
-  ring.material.color = '#f59e0b'
-
   const sun = createSceneObject('directionalLight')
   sun.id = 'sun-light'
   sun.name = '主平行光'
 
-  return [ground, hero, sphere, ring, sun]
+  // 组合件「标准展柜」：底座圆柱 + 顶部展台方块
+  const pedestal = createSceneObject('cylinder')
+  pedestal.id = 'pf-pedestal'
+  pedestal.name = '展柜底座'
+  pedestal.position = [0, 0.55, 0]
+  pedestal.scale = [0.7, 1, 0.7]
+  pedestal.material.color = '#e2e8f0'
+  pedestal.material.roughness = 0.32
+
+  const top = createSceneObject('box')
+  top.id = 'pf-top'
+  top.name = '展台方块'
+  top.parentId = 'pf-pedestal'
+  top.position = [0, 0.9, 0]
+  top.scale = [0.85, 0.35, 0.85]
+  top.material.color = '#2563eb'
+
+  const showcase: PrefabAsset = {
+    id: 'prefab-showcase',
+    name: '标准展柜',
+    nodes: [pedestal, top],
+    createdAt: new Date().toISOString(),
+  }
+
+  const instanceA = createInstanceHandle(showcase, '展柜 A', [-2.4, 0, 1.6])
+  instanceA.id = 'showcase-a'
+  // 展柜 B：顶部方块被单独改成红色（材质颜色覆盖），源改色盖不掉
+  const instanceB = createInstanceHandle(showcase, '展柜 B', [2.4, 0, 1.6])
+  instanceB.id = 'showcase-b'
+  instanceB.overrides = [
+    {
+      nodePath: 'pf-top',
+      patch: { material: { color: '#dc2626' } },
+    },
+  ]
+
+  return {
+    prefabs: [showcase],
+    objects: [ground, sun, instanceA, instanceB],
+  }
+}
+
+/** 生成组合件引用实例句柄（type=group，自身不渲染几何，只承载摆放与覆盖） */
+export function createInstanceHandle(prefab: PrefabAsset, name: string, position: Vec3): SceneObject {
+  return {
+    id: uid('instance'),
+    name,
+    type: 'group',
+    parentId: null,
+    visible: true,
+    position: [...position] as Vec3,
+    rotation: [0, 0, 0],
+    scale: [1, 1, 1],
+    castShadow: false,
+    receiveShadow: false,
+    material: { color: '#ffffff', roughness: 1, metalness: 0, opacity: 1, wireframe: false },
+    instanceOf: prefab.id,
+    overrides: [],
+  }
 }
 
 export function isGeometry(type: ObjectType) {

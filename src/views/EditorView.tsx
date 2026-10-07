@@ -27,10 +27,12 @@ import InspectorPanel from '../components/InspectorPanel'
 import SceneViewport from '../components/SceneViewport'
 import { useEditorStore } from '../stores/editor'
 import type { SceneDocument, TransformMode } from '../types/scene'
+import { resolveScene } from '../utils/prefabs'
 
 export default function EditorView() {
   const store = useEditorStore()
-  const selectedObject = store.objects.find((item) => item.id === store.selectedId)
+  const resolved = resolveScene(store.objects, store.prefabs)
+  const selectedObject = store.selectedKey ? resolved.nodes.get(store.selectedKey) : undefined
 
   useEffect(() => {
     const onKeyDown = (event: KeyboardEvent) => {
@@ -39,18 +41,25 @@ export default function EditorView() {
       if (event.key.toLowerCase() === 'g') store.setTransformMode('translate')
       if (event.key.toLowerCase() === 'r') store.setTransformMode('rotate')
       if (event.key.toLowerCase() === 's') store.setTransformMode('scale')
-      if ((event.key === 'Delete' || event.key === 'Backspace') && store.selectedId) store.remove(store.selectedId)
+      if ((event.key === 'Delete' || event.key === 'Backspace') && store.selectedKey) store.remove(store.selectedKey)
       if ((event.metaKey || event.ctrlKey) && event.key.toLowerCase() === 's') {
         event.preventDefault()
         exportScene()
       }
+      if (event.key === 'Escape') store.exitPrefab()
     }
     window.addEventListener('keydown', onKeyDown)
     return () => window.removeEventListener('keydown', onKeyDown)
   })
 
   function exportScene() {
-    const document: SceneDocument = { version: 1, name: store.name, objects: store.objects, savedAt: new Date().toISOString() }
+    const document: SceneDocument = {
+      version: 2,
+      name: store.name,
+      objects: store.objects,
+      prefabs: store.prefabs,
+      savedAt: new Date().toISOString(),
+    }
     const blob = new Blob([JSON.stringify(document, null, 2)], { type: 'application/json' })
     const url = URL.createObjectURL(blob)
     const anchor = window.document.createElement('a')
@@ -58,14 +67,17 @@ export default function EditorView() {
     anchor.download = `${store.name}.scene.json`
     anchor.click()
     URL.revokeObjectURL(url)
-    store.noticeMessage('场景 JSON 已保存')
+    store.noticeMessage('场景 JSON 已保存（含组合件定义）')
   }
 
   async function importScene(file: File) {
     try {
-      const document = JSON.parse(await file.text()) as SceneDocument
-      if (!Array.isArray(document.objects)) throw new Error('场景 JSON 缺少 objects')
-      store.loadScene(document)
+      const parsed = JSON.parse(await file.text()) as unknown
+      if (parsed && typeof parsed === 'object' && Array.isArray((parsed as { objects?: unknown }).objects)) {
+        store.loadScene(parsed)
+      } else {
+        throw new Error('场景 JSON 缺少 objects')
+      }
     } catch (error) {
       store.noticeMessage(error instanceof Error ? error.message : '场景文件无效')
     }
@@ -89,7 +101,22 @@ export default function EditorView() {
           <Button variant="outlined" size="small" onClick={() => store.setPerformance({ instanceMode: !store.performance.instanceMode })}>
             {store.performance.instanceMode ? '实例模式：开' : '实例模式：关'}
           </Button>
-          <Button variant="outlined" size="small" startIcon={<SpeedOutlined />} onClick={() => store.addStressObjects(240)}>添加 240 个物体</Button>
+          <Button variant="outlined" size="small" startIcon={<SpeedOutlined />} onClick={() => store.addStressObjects(240)}>压力测试 240</Button>
+          {store.prefabs[0] && (
+            <Button
+              variant="outlined"
+              size="small"
+              color="secondary"
+              onClick={() => {
+                for (let i = 0; i < 60; i += 1) store.addPrefabInstance(store.prefabs[0].id)
+              }}
+            >
+              放置 60 个引用
+            </Button>
+          )}
+          {store.editingPrefabId && (
+            <Button size="small" variant="contained" color="secondary" onClick={store.exitPrefab}>返回场景（Esc）</Button>
+          )}
           <Stack direction="row" spacing={0.5}>
             {modes.map((mode) => (
               <Tooltip key={mode.value} title={mode.label}>
@@ -129,8 +156,15 @@ export default function EditorView() {
       </main>
       <div className="statusbar">
         <span>{selectedObject ? `已选择：${selectedObject.name}` : '未选择对象'}</span>
-        <span>对象 {store.objects.length} · 位置 {selectedObject?.position.map((item) => item.toFixed(2)).join(' / ') ?? '--'}</span>
-        <span>{store.performance.instanceMode ? 'InstancedMesh 批量渲染' : '独立对象渲染'}</span>
+        <span>
+          场景对象 {store.objects.length} · 组合件 {store.prefabs.length} · 渲染节点 {resolved.nodes.size}
+          {selectedObject ? ` · 位置 ${selectedObject.position.map((item) => item.toFixed(2)).join(' / ')}` : ''}
+        </span>
+        <span>
+          {store.editingPrefabId ? '组合件源编辑中' : store.performance.instanceMode ? 'InstancedMesh 批量渲染' : '独立对象渲染'}
+          {store.render.phase === 'batching' ? ` · 分批 ${store.render.done}/${store.render.total}` : ''}
+          {store.render.phase === 'recovering' ? ' · 恢复现场' : ''}
+        </span>
       </div>
       <Snackbar open={Boolean(store.notice)} autoHideDuration={2600} onClose={() => store.noticeMessage('')} message={store.notice} />
     </Box>
