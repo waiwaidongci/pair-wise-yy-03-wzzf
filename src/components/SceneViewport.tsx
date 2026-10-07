@@ -1,18 +1,46 @@
 import { Canvas, type ThreeEvent, useThree } from '@react-three/fiber'
 import { Grid, OrbitControls, PerspectiveCamera, Stats, TransformControls, useCursor } from '@react-three/drei'
 import { Leva, useControls } from 'leva'
-import { useEffect, useMemo, useRef, useState } from 'react'
+import { Component, useEffect, useMemo, useRef, useState, type ReactNode } from 'react'
 import * as THREE from 'three'
 import type { SceneObject } from '../types/scene'
 import { useEditorStore } from '../stores/editor'
 import { isGeometry, TYPE_LABELS, worldMatrix } from '../utils/scene'
+import {
+  BATCH_CHUNK_SIZE,
+  BATCH_INSTANCE_THRESHOLD,
+  captureSnapshot,
+  lastGoodSnapshot,
+  resolveInstance,
+  type ResolvedNode,
+} from '../utils/components'
 import Geometry from './Geometry'
 
 interface Registry {
   current: Map<string, THREE.Object3D>
 }
 
-function GeometryMesh({ object, registry }: { object: SceneObject; registry: Registry }) {
+/** 渲染失败后恢复现场：恢复到最近一次成功渲染的快照 */
+class RenderGuard extends Component<{ children: ReactNode; onRestore?: () => void }, { failed: boolean }> {
+  state = { failed: false }
+  static getDerivedStateFromError() {
+    return { failed: true }
+  }
+  componentDidCatch(error: unknown) {
+    console.error('渲染失败，正在恢复现场', error)
+    const snapshot = lastGoodSnapshot
+    if (snapshot) {
+      useEditorStore.setState({ objects: snapshot.objects, components: snapshot.components })
+    }
+    useEditorStore.getState().noticeMessage('渲染失败，已恢复到上一个正常场景')
+    this.props.onRestore?.()
+  }
+  render() {
+    return this.state.failed ? null : this.props.children
+  }
+}
+
+function GeometryMesh({ object, registry, selectId }: { object: SceneObject; registry: Registry; selectId?: string }) {
   const select = useEditorStore((state) => state.select)
   const [hovered, setHovered] = useState(false)
   useCursor(hovered)
@@ -25,7 +53,7 @@ function GeometryMesh({ object, registry }: { object: SceneObject; registry: Reg
 
   function handlePointer(event: ThreeEvent<MouseEvent>) {
     event.stopPropagation()
-    select(object.id)
+    select(selectId ?? object.id)
   }
 
   return (
@@ -53,7 +81,7 @@ function GeometryMesh({ object, registry }: { object: SceneObject; registry: Reg
   )
 }
 
-function LightObject({ object, registry }: { object: SceneObject; registry: Registry }) {
+function LightObject({ object, registry, selectId }: { object: SceneObject; registry: Registry; selectId?: string }) {
   const select = useEditorStore((state) => state.select)
   const groupRef = useRef<THREE.Group>(null!)
   useEffect(() => {
@@ -68,7 +96,7 @@ function LightObject({ object, registry }: { object: SceneObject; registry: Regi
   }
 
   return (
-    <group ref={groupRef} position={object.position} rotation={object.rotation} onClick={(event) => { event.stopPropagation(); select(object.id) }}>
+    <group ref={groupRef} position={object.position} rotation={object.rotation} onClick={(event) => { event.stopPropagation(); select(selectId ?? object.id) }}>
       {object.type === 'directionalLight' && <directionalLight {...common} />}
       {object.type === 'pointLight' && <pointLight {...common} distance={object.distance} />}
       {object.type === 'spotLight' && <spotLight {...common} distance={object.distance} angle={0.45} penumbra={0.35} />}
@@ -80,7 +108,7 @@ function LightObject({ object, registry }: { object: SceneObject; registry: Regi
   )
 }
 
-function CameraObject({ object, registry }: { object: SceneObject; registry: Registry }) {
+function CameraObject({ object, registry, selectId }: { object: SceneObject; registry: Registry; selectId?: string }) {
   const select = useEditorStore((state) => state.select)
   const cameraRef = useRef<THREE.PerspectiveCamera>(null!)
   useEffect(() => {
@@ -88,7 +116,7 @@ function CameraObject({ object, registry }: { object: SceneObject; registry: Reg
     return () => { registry.current.delete(object.id) }
   }, [object.id, registry])
   return (
-    <group position={object.position} rotation={object.rotation} onClick={(event) => { event.stopPropagation(); select(object.id) }}>
+    <group position={object.position} rotation={object.rotation} onClick={(event) => { event.stopPropagation(); select(selectId ?? object.id) }}>
       <PerspectiveCamera ref={cameraRef} makeDefault={object.activeCamera} fov={object.fov ?? 50} near={0.1} far={1000} />
       <mesh scale={0.25}>
         <boxGeometry args={[0.8, 0.55, 0.7]} />
@@ -98,8 +126,48 @@ function CameraObject({ object, registry }: { object: SceneObject; registry: Reg
   )
 }
 
+/** 渲染解析后的组合件节点树；selectId 用于把整棵实例子树的拾取归到实例对象上 */
+function ResolvedNodeView({ node, registry, selectId, registerId }: {
+  node: ResolvedNode
+  registry: Registry
+  selectId?: string
+  registerId?: string
+}) {
+  const object = node.object
+  const groupRef = useRef<THREE.Group>(null!)
+  useEffect(() => {
+    if (registerId && groupRef.current) registry.current.set(registerId, groupRef.current)
+    return () => { if (registerId) registry.current.delete(registerId) }
+  }, [registerId, registry])
+
+  const isLight = object.type.includes('Light')
+  const isCamera = object.type === 'camera'
+  return (
+    <group ref={groupRef} position={object.position} rotation={object.rotation} scale={object.scale}>
+      {isGeometry(object.type) && <GeometryMesh object={object} registry={registry} selectId={selectId} />}
+      {isCamera && <CameraObject object={object} registry={registry} selectId={selectId} />}
+      {!isGeometry(object.type) && !isCamera && <LightObject object={object} registry={registry} selectId={selectId} />}
+      {node.children.map((child, index) => (
+        <ResolvedNodeView key={index} node={child} registry={registry} selectId={selectId} />
+      ))}
+    </group>
+  )
+}
+
+/** 引用实例：解析源组合件模板并渲染，覆盖项使用实例自身的值 */
+function ResolvedInstance({ object, registry }: { object: SceneObject; registry: Registry }) {
+  const components = useEditorStore((state) => state.components)
+  const resolved = useMemo(() => resolveInstance(object, components), [object, components])
+  return <ResolvedNodeView node={resolved} registry={registry} selectId={object.id} registerId={object.id} />
+}
+
 function ObjectView({ object, objects, registry }: { object: SceneObject; objects: SceneObject[]; registry: Registry }) {
   const children = objects.filter((item) => item.parentId === object.id)
+
+  if (object.componentId) {
+    return <ResolvedInstance object={object} registry={registry} />
+  }
+
   if (isGeometry(object.type) || object.parentId) {
     return (
       <group position={object.position} rotation={object.rotation} scale={object.scale}>
@@ -197,27 +265,71 @@ function InstanceBatch({ type, objects, registry }: { type: SceneObject['type'];
   )
 }
 
+/** 引用实例数量较多时，按批逐帧渲染，避免一次性提交卡死；失败由 RenderGuard 恢复现场 */
+function BatchedInstances({ instances, registry }: { instances: SceneObject[]; registry: Registry }) {
+  const [visibleCount, setVisibleCount] = useState(BATCH_CHUNK_SIZE)
+  useEffect(() => {
+    if (visibleCount >= instances.length) return
+    const id = requestAnimationFrame(() => {
+      setVisibleCount((count) => Math.min(count + BATCH_CHUNK_SIZE, instances.length))
+    })
+    return () => cancelAnimationFrame(id)
+  }, [visibleCount, instances.length])
+
+  const shown = instances.slice(0, visibleCount)
+  return <>{shown.map((object) => <ObjectView key={object.id} object={object} objects={instances} registry={registry} />)}</>
+}
+
+function SceneRoots({ objects, registry }: { objects: SceneObject[]; registry: Registry }) {
+  const roots = objects.filter((object) => !object.parentId)
+  const instanceRoots = roots.filter((object) => object.componentId)
+  const normalRoots = roots.filter((object) => !object.componentId)
+  const many = instanceRoots.length > BATCH_INSTANCE_THRESHOLD
+  return (
+    <>
+      {normalRoots.map((object) => <ObjectView key={object.id} object={object} objects={objects} registry={registry} />)}
+      {many
+        ? <BatchedInstances instances={instanceRoots} registry={registry} />
+        : instanceRoots.map((object) => <ObjectView key={object.id} object={object} objects={objects} registry={registry} />)}
+    </>
+  )
+}
+
 function InstancedScene({ objects, registry }: { objects: SceneObject[]; registry: Registry }) {
   const batches = useMemo(() => {
     const map = new Map<SceneObject['type'], SceneObject[]>()
-    objects.filter((object) => isGeometry(object.type) && object.visible).forEach((object) => {
-      map.set(object.type, [...(map.get(object.type) ?? []), object])
-    })
+    objects
+      .filter((object) => isGeometry(object.type) && object.visible && !object.componentId)
+      .forEach((object) => {
+        map.set(object.type, [...(map.get(object.type) ?? []), object])
+      })
     return [...map.entries()]
   }, [objects])
-  const singleObjects = objects.filter((object) => !isGeometry(object.type) && !object.parentId)
+  const singleObjects = objects.filter((object) => !isGeometry(object.type) && !object.parentId && !object.componentId)
+  const instanceRoots = objects.filter((object) => !object.parentId && object.componentId)
+  const many = instanceRoots.length > BATCH_INSTANCE_THRESHOLD
   return (
     <>
       {batches.map(([type, batch]) => <InstanceBatch key={type} type={type} objects={batch} registry={registry} />)}
       {singleObjects.map((object) => <ObjectView key={object.id} object={object} objects={objects} registry={registry} />)}
+      {many
+        ? <BatchedInstances instances={instanceRoots} registry={registry} />
+        : instanceRoots.map((object) => <ObjectView key={object.id} object={object} objects={objects} registry={registry} />)}
     </>
   )
 }
 
 function SceneContent({ registry }: { registry: Registry }) {
   const objects = useEditorStore((state) => state.objects)
+  const components = useEditorStore((state) => state.components)
   const performance = useEditorStore((state) => state.performance)
   const showGrid = performance.showGrid
+
+  // 每次成功渲染后捕获现场快照，供渲染失败时恢复
+  useEffect(() => {
+    captureSnapshot(objects, components)
+  }, [objects, components])
+
   return (
     <>
       <color attach="background" args={['#cdd7e5']} />
@@ -227,7 +339,7 @@ function SceneContent({ registry }: { registry: Registry }) {
       {performance.instanceMode ? (
         <InstancedScene objects={objects} registry={registry} />
       ) : (
-        objects.filter((object) => !object.parentId).map((object) => <ObjectView key={object.id} object={object} objects={objects} registry={registry} />)
+        <SceneRoots objects={objects} registry={registry} />
       )}
       {!performance.instanceMode && <SelectionControls registry={registry} />}
     </>
@@ -247,6 +359,7 @@ function RenderControls() {
 export default function SceneViewport() {
   const registry = useRef<Map<string, THREE.Object3D>>(new Map())
   const performance = useEditorStore((state) => state.performance)
+  const [guardKey, setGuardKey] = useState(0)
   return (
     <div className="viewport-wrap">
       <Canvas
@@ -256,7 +369,9 @@ export default function SceneViewport() {
         gl={{ antialias: !performance.instanceMode, powerPreference: 'high-performance' }}
       >
         <OrbitControls makeDefault enableDamping dampingFactor={0.08} minDistance={2} maxDistance={45} />
-        <SceneContent registry={registry} />
+        <RenderGuard key={guardKey} onRestore={() => setGuardKey((key) => key + 1)}>
+          <SceneContent registry={registry} />
+        </RenderGuard>
         <RenderControls />
       </Canvas>
       <Leva collapsed titleBar={{ title: '视图控制' }} />

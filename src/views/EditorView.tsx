@@ -14,6 +14,7 @@ import {
 import {
   CloudDownloadOutlined,
   CloudUploadOutlined,
+  DiamondOutlined,
   OpenWithOutlined,
   RotateRightOutlined,
   SaveOutlined,
@@ -26,7 +27,8 @@ import HierarchyPanel from '../components/HierarchyPanel'
 import InspectorPanel from '../components/InspectorPanel'
 import SceneViewport from '../components/SceneViewport'
 import { useEditorStore } from '../stores/editor'
-import type { SceneDocument, TransformMode } from '../types/scene'
+import type { TransformMode } from '../types/scene'
+import { CURRENT_VERSION } from '../utils/components'
 
 export default function EditorView() {
   const store = useEditorStore()
@@ -50,7 +52,13 @@ export default function EditorView() {
   })
 
   function exportScene() {
-    const document: SceneDocument = { version: 1, name: store.name, objects: store.objects, savedAt: new Date().toISOString() }
+    const document = {
+      version: CURRENT_VERSION,
+      name: store.name,
+      objects: store.objects,
+      components: store.components,
+      savedAt: new Date().toISOString(),
+    }
     const blob = new Blob([JSON.stringify(document, null, 2)], { type: 'application/json' })
     const url = URL.createObjectURL(blob)
     const anchor = window.document.createElement('a')
@@ -63,7 +71,7 @@ export default function EditorView() {
 
   async function importScene(file: File) {
     try {
-      const document = JSON.parse(await file.text()) as SceneDocument
+      const document = JSON.parse(await file.text())
       if (!Array.isArray(document.objects)) throw new Error('场景 JSON 缺少 objects')
       store.loadScene(document)
     } catch (error) {
@@ -90,6 +98,16 @@ export default function EditorView() {
             {store.performance.instanceMode ? '实例模式：开' : '实例模式：关'}
           </Button>
           <Button variant="outlined" size="small" startIcon={<SpeedOutlined />} onClick={() => store.addStressObjects(240)}>添加 240 个物体</Button>
+          <Button
+            variant="outlined"
+            size="small"
+            color="secondary"
+            startIcon={<DiamondOutlined />}
+            disabled={!store.selectedId}
+            onClick={() => store.makeComponent(store.selectedId ? [store.selectedId] : [])}
+          >
+            做成组合件
+          </Button>
           <Stack direction="row" spacing={0.5}>
             {modes.map((mode) => (
               <Tooltip key={mode.value} title={mode.label}>
